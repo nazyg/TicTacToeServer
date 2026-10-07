@@ -3,6 +3,8 @@ using UnityEngine.Assertions;
 using Unity.Collections;
 using Unity.Networking.Transport;
 using System.Text;
+using System.Collections.Generic;
+using System.IO;
 
 public class NetworkServer : MonoBehaviour
 {
@@ -15,6 +17,13 @@ public class NetworkServer : MonoBehaviour
     const ushort NetworkPort = 9001;
 
     const int MaxNumberOfClientConnections = 1000;
+
+    // Every accepted connection gets its own connection ID.
+    Dictionary<NetworkConnection, int> connectionIdByConnection = new Dictionary<NetworkConnection, int>();
+    Dictionary<int, NetworkConnection> connectionById = new Dictionary<int, NetworkConnection>();
+    int nextConnectionId = 1;
+
+    AccountManager accountManager;
 
     void Start()
     {
@@ -31,6 +40,8 @@ public class NetworkServer : MonoBehaviour
             networkDriver.Listen();
 
         networkConnections = new NativeList<NetworkConnection>(MaxNumberOfClientConnections, Allocator.Persistent);
+
+        accountManager = new AccountManager(Path.Combine(Application.persistentDataPath, "Accounts.txt"));
     }
 
     void OnDestroy()
@@ -41,18 +52,6 @@ public class NetworkServer : MonoBehaviour
 
     void Update()
     {
-        #region Check Input and Send Msg
-
-        if (Input.GetKeyDown(KeyCode.A))
-        {
-            for (int i = 0; i < networkConnections.Length; i++)
-            {
-                SendMessageToClient("Hello client's world, sincerely your network server", networkConnections[i]);
-            }
-        }
-
-        #endregion
-
         networkDriver.ScheduleUpdate().Complete();
 
         #region Remove Unused Connections
@@ -72,7 +71,6 @@ public class NetworkServer : MonoBehaviour
 
         while (AcceptIncomingConnection())
         {
-            Debug.Log("Accepted a client connection");
         }
 
         #endregion
@@ -103,11 +101,11 @@ public class NetworkServer : MonoBehaviour
                         streamReader.ReadBytes(buffer);
                         byte[] byteBuffer = buffer.ToArray();
                         string msg = Encoding.Unicode.GetString(byteBuffer);
-                        ProcessReceivedMsg(msg);
+                        ProcessReceivedMsg(msg, connectionIdByConnection[networkConnections[i]]);
                         buffer.Dispose();
                         break;
                     case NetworkEvent.Type.Disconnect:
-                        Debug.Log("Client has disconnected from server");
+                        OnClientDisconnected(networkConnections[i]);
                         networkConnections[i] = default(NetworkConnection);
                         break;
                 }
@@ -124,6 +122,11 @@ public class NetworkServer : MonoBehaviour
             return false;
 
         networkConnections.Add(connection);
+
+        int connectionId = nextConnectionId++;
+        connectionIdByConnection.Add(connection, connectionId);
+        connectionById.Add(connectionId, connection);
+        Debug.Log("Accepted a client connection, connection ID = " + connectionId);
         return true;
     }
 
@@ -136,9 +139,64 @@ public class NetworkServer : MonoBehaviour
         return true;
     }
 
-    private void ProcessReceivedMsg(string msg)
+    private void OnClientDisconnected(NetworkConnection connection)
     {
-        Debug.Log("Msg received = " + msg);
+        if (!connectionIdByConnection.TryGetValue(connection, out int connectionId))
+            return;
+
+        Debug.Log("Client with connection ID " + connectionId + " has disconnected from server");
+        accountManager.OnClientDisconnected(connectionId);
+        connectionIdByConnection.Remove(connection);
+        connectionById.Remove(connectionId);
+    }
+
+    private void ProcessReceivedMsg(string msg, int connectionId)
+    {
+        Debug.Log("Msg received from connection " + connectionId + " = " + msg);
+
+        string[] values = msg.Split(NetworkMessageFormat.Separator);
+        if (!int.TryParse(values[0], out int signifier))
+        {
+            Debug.LogWarning("Could not read signifier of msg: " + msg);
+            return;
+        }
+
+        switch (signifier)
+        {
+            case ClientToServerSignifiers.CreateAccount:
+            {
+                AccountResult result = values.Length == 3
+                    ? accountManager.CreateAccount(values[1], values[2])
+                    : AccountResult.MalformedMessage;
+                string name = values.Length > 1 ? values[1] : "";
+                SendMessageToClient(ServerToClientSignifiers.CreateAccountResult + "," + (int)result + "," + name, connectionId);
+                break;
+            }
+            case ClientToServerSignifiers.Login:
+            {
+                string accountName = values.Length > 1 ? values[1] : "";
+                AccountResult result = values.Length == 3
+                    ? accountManager.Login(connectionId, values[1], values[2], out accountName)
+                    : AccountResult.MalformedMessage;
+                SendMessageToClient(ServerToClientSignifiers.LoginResult + "," + (int)result + "," + accountName, connectionId);
+                break;
+            }
+            case ClientToServerSignifiers.Logout:
+            {
+                AccountResult result = accountManager.Logout(connectionId);
+                SendMessageToClient(ServerToClientSignifiers.LogoutResult + "," + (int)result, connectionId);
+                break;
+            }
+            default:
+                Debug.LogWarning("Unknown signifier " + signifier + " from connection " + connectionId);
+                break;
+        }
+    }
+
+    public void SendMessageToClient(string msg, int connectionId)
+    {
+        if (connectionById.TryGetValue(connectionId, out NetworkConnection connection))
+            SendMessageToClient(msg, connection);
     }
 
     public void SendMessageToClient(string msg, NetworkConnection networkConnection)
