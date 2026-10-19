@@ -8,6 +8,7 @@ public class GameRoom
     public List<int> playerConnectionIds = new List<int>();
     public TicTacToeBoard board = new TicTacToeBoard();
     public HashSet<int> rematchRequests = new HashSet<int>();
+    public List<int> observerConnectionIds = new List<int>();
 
     public bool IsFull => playerConnectionIds.Count >= GameRoomRules.MaxPlayersPerRoom;
 
@@ -36,6 +37,7 @@ public class GameRoomManager
 {
     readonly Dictionary<string, GameRoom> roomsByName = new Dictionary<string, GameRoom>(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<int, GameRoom> roomByConnectionId = new Dictionary<int, GameRoom>();
+    readonly Dictionary<int, GameRoom> roomByObserverId = new Dictionary<int, GameRoom>();
 
     const int MaxChatMessageLength = 100;
 
@@ -148,13 +150,15 @@ public class GameRoomManager
         string msg = ServerToClientSignifiers.BoardUpdate + "," + room.board.Serialize();
         foreach (int playerId in room.playerConnectionIds)
             sendMessageToClient(msg, playerId);
+        foreach (int observerId in room.observerConnectionIds)
+            sendMessageToClient(msg, observerId);
     }
 
     ResultCode CheckCanJoin(int connectionId, string roomName)
     {
         if (getAccountName(connectionId) == null)
             return ResultCode.NotLoggedIn;
-        if (roomByConnectionId.ContainsKey(connectionId))
+        if (roomByConnectionId.ContainsKey(connectionId) || roomByObserverId.ContainsKey(connectionId))
             return ResultCode.AlreadyInGameRoom;
 
         ResultCode validation = GameRoomRules.Validate(roomName == null ? null : roomName.Trim());
@@ -183,6 +187,66 @@ public class GameRoomManager
     {
         if (roomByConnectionId.TryGetValue(connectionId, out GameRoom room))
             RemoveFromRoom(connectionId, room);
+        else if (roomByObserverId.TryGetValue(connectionId, out GameRoom watchedRoom))
+            RemoveObserver(connectionId, watchedRoom);
+    }
+
+    public void Watch(int connectionId, string roomName)
+    {
+        ResultCode result = CheckCanWatch(connectionId, roomName, out GameRoom room);
+        if (result != ResultCode.Success)
+        {
+            sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)result, connectionId);
+            return;
+        }
+
+        room.observerConnectionIds.Add(connectionId);
+        roomByObserverId.Add(connectionId, room);
+        Debug.Log(getAccountName(connectionId) + " is now watching game room '" + room.name + "'");
+
+        string playerXName = getAccountName(room.playerConnectionIds[0]);
+        string playerOName = getAccountName(room.playerConnectionIds[1]);
+        sendMessageToClient(ServerToClientSignifiers.ObservingStarted + "," + room.name + "," + playerXName + "," + playerOName, connectionId);
+        sendMessageToClient(ServerToClientSignifiers.BoardUpdate + "," + room.board.Serialize(), connectionId);
+    }
+
+    ResultCode CheckCanWatch(int connectionId, string roomName, out GameRoom room)
+    {
+        room = null;
+        if (getAccountName(connectionId) == null)
+            return ResultCode.NotLoggedIn;
+        if (roomByConnectionId.ContainsKey(connectionId) || roomByObserverId.ContainsKey(connectionId))
+            return ResultCode.AlreadyInGameRoom;
+
+        ResultCode validation = GameRoomRules.Validate(roomName == null ? null : roomName.Trim());
+        if (validation != ResultCode.Success)
+            return validation;
+
+        if (!roomsByName.TryGetValue(roomName.Trim(), out room))
+            return ResultCode.RoomNotFound;
+        if (!room.IsFull)
+            return ResultCode.GameNotStarted;
+
+        return ResultCode.Success;
+    }
+
+    public void StopWatching(int connectionId)
+    {
+        if (!roomByObserverId.TryGetValue(connectionId, out GameRoom room))
+        {
+            sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)ResultCode.NotWatching, connectionId);
+            return;
+        }
+
+        RemoveObserver(connectionId, room);
+        sendMessageToClient(ServerToClientSignifiers.StoppedWatching.ToString(), connectionId);
+    }
+
+    void RemoveObserver(int connectionId, GameRoom room)
+    {
+        room.observerConnectionIds.Remove(connectionId);
+        roomByObserverId.Remove(connectionId);
+        Debug.Log("Connection " + connectionId + " stopped watching game room '" + room.name + "'");
     }
 
     void RemoveFromRoom(int connectionId, GameRoom room)
@@ -198,6 +262,13 @@ public class GameRoomManager
             roomByConnectionId.Remove(remainingId);
             sendMessageToClient(ServerToClientSignifiers.OpponentLeftGameRoom + "," + leavingPlayerName, remainingId);
         }
+
+        foreach (int observerId in room.observerConnectionIds)
+        {
+            roomByObserverId.Remove(observerId);
+            sendMessageToClient(ServerToClientSignifiers.OpponentLeftGameRoom + "," + leavingPlayerName, observerId);
+        }
+        room.observerConnectionIds.Clear();
 
         roomsByName.Remove(room.name);
         Debug.Log("Game room '" + room.name + "' closed");

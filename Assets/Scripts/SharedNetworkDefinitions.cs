@@ -15,6 +15,8 @@ public static class ClientToServerSignifiers
     public const int SendMessageToOpponent = 6;
     public const int PlaceMark = 7;
     public const int RequestRematch = 8;
+    public const int WatchGameRoom = 9;
+    public const int StopWatching = 10;
 }
 
 public static class ServerToClientSignifiers
@@ -31,6 +33,8 @@ public static class ServerToClientSignifiers
     public const int BoardUpdate = 10;
     public const int MoveRejected = 11;
     public const int OpponentWantsRematch = 12;
+    public const int ObservingStarted = 13;
+    public const int StoppedWatching = 14;
 }
 
 public enum ResultCode
@@ -56,6 +60,9 @@ public enum ResultCode
     CellOccupied = 18,
     GameOver = 19,
     GameNotOver = 20,
+    RoomNotFound = 21,
+    GameNotStarted = 22,
+    NotWatching = 23,
 }
 
 public static class AccountRules
@@ -126,6 +133,9 @@ public static class ResultCodeMessages
             case ResultCode.CellOccupied: return "That cell is already taken.";
             case ResultCode.GameOver: return "The game is over.";
             case ResultCode.GameNotOver: return "The game is not over yet.";
+            case ResultCode.RoomNotFound: return "No game room exists with that name.";
+            case ResultCode.GameNotStarted: return "That game hasn't started yet. Try again when two players are in the room.";
+            case ResultCode.NotWatching: return "You are not watching a game room.";
             default: return "Unknown error (" + (int)result + ").";
         }
     }

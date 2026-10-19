@@ -64,6 +64,12 @@ public class NetworkServerProcessing
                 else
                     sendMessageToClient(ServerToClientSignifiers.MoveRejected + "," + (int)ResultCode.MalformedMessage, connectionId);
                 break;
+            case ClientToServerSignifiers.WatchGameRoom:
+                gameRoomManager.Watch(connectionId, values.Length == 2 ? values[1] : null);
+                break;
+            case ClientToServerSignifiers.StopWatching:
+                gameRoomManager.StopWatching(connectionId);
+                break;
             case ClientToServerSignifiers.RequestRematch:
                 gameRoomManager.RequestRematch(connectionId);
                 break;
