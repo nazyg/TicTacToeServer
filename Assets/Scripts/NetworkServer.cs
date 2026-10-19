@@ -18,12 +18,12 @@ public class NetworkServer : MonoBehaviour
 
     const int MaxNumberOfClientConnections = 1000;
 
-    // Every accepted connection gets its own connection ID.
     Dictionary<NetworkConnection, int> connectionIdByConnection = new Dictionary<NetworkConnection, int>();
     Dictionary<int, NetworkConnection> connectionById = new Dictionary<int, NetworkConnection>();
     int nextConnectionId = 1;
 
     AccountManager accountManager;
+    GameRoomManager gameRoomManager;
 
     void Start()
     {
@@ -42,6 +42,7 @@ public class NetworkServer : MonoBehaviour
         networkConnections = new NativeList<NetworkConnection>(MaxNumberOfClientConnections, Allocator.Persistent);
 
         accountManager = new AccountManager(Path.Combine(Application.persistentDataPath, "Accounts.txt"));
+        gameRoomManager = new GameRoomManager(SendMessageToClient, accountManager.GetAccountName);
     }
 
     void OnDestroy()
@@ -145,6 +146,7 @@ public class NetworkServer : MonoBehaviour
             return;
 
         Debug.Log("Client with connection ID " + connectionId + " has disconnected from server");
+        gameRoomManager.OnClientDisconnectedOrLoggedOut(connectionId);
         accountManager.OnClientDisconnected(connectionId);
         connectionIdByConnection.Remove(connection);
         connectionById.Remove(connectionId);
@@ -183,10 +185,20 @@ public class NetworkServer : MonoBehaviour
             }
             case ClientToServerSignifiers.Logout:
             {
+                gameRoomManager.OnClientDisconnectedOrLoggedOut(connectionId);
                 AccountResult result = accountManager.Logout(connectionId);
                 SendMessageToClient(ServerToClientSignifiers.LogoutResult + "," + (int)result, connectionId);
                 break;
             }
+            case ClientToServerSignifiers.JoinOrCreateGameRoom:
+                gameRoomManager.JoinOrCreate(connectionId, values.Length == 2 ? values[1] : null);
+                break;
+            case ClientToServerSignifiers.LeaveGameRoom:
+                gameRoomManager.Leave(connectionId);
+                break;
+            case ClientToServerSignifiers.SendMessageToOpponent:
+                gameRoomManager.SendMessageToOpponent(connectionId, values.Length > 1 ? string.Join(",", values, 1, values.Length - 1) : "");
+                break;
             default:
                 Debug.LogWarning("Unknown signifier " + signifier + " from connection " + connectionId);
                 break;

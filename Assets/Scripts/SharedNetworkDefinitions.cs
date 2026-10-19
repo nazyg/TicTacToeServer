@@ -10,6 +10,9 @@ public static class ClientToServerSignifiers
     public const int CreateAccount = 1;   
     public const int Login = 2;          
     public const int Logout = 3;          
+    public const int JoinOrCreateGameRoom = 4;
+    public const int LeaveGameRoom = 5;
+    public const int SendMessageToOpponent = 6;
 }
 
 public static class ServerToClientSignifiers
@@ -17,6 +20,12 @@ public static class ServerToClientSignifiers
     public const int CreateAccountResult = 1;   
     public const int LoginResult = 2;           
     public const int LogoutResult = 3;          
+    public const int GameRoomError = 4;
+    public const int WaitingForOpponent = 5;
+    public const int GameStarted = 6;
+    public const int OpponentMessage = 7;
+    public const int LeftGameRoom = 8;
+    public const int OpponentLeftGameRoom = 9;
 }
 
 public enum AccountResult
@@ -34,6 +43,10 @@ public enum AccountResult
     AlreadyLoggedInOnThisConnection = 10,
     NotLoggedIn = 11,
     MalformedMessage = 12,
+    RoomNameInvalid = 13,
+    RoomFull = 14,
+    AlreadyInGameRoom = 15,
+    NotInGameRoom = 16,
 }
 
 public static class AccountRules
@@ -77,7 +90,26 @@ public static class AccountRules
             case AccountResult.AlreadyLoggedInOnThisConnection: return "You are already logged in.";
             case AccountResult.NotLoggedIn: return "You are not logged in.";
             case AccountResult.MalformedMessage: return "The server could not read the request.";
+            case AccountResult.RoomNameInvalid: return "Room names must be 1-" + GameRoomRules.MaxRoomNameLength + " characters (letters, numbers, spaces or _ only).";
+            case AccountResult.RoomFull: return "That game room is full.";
+            case AccountResult.AlreadyInGameRoom: return "You are already in a game room.";
+            case AccountResult.NotInGameRoom: return "You are not in a game room.";
             default: return "Unknown error (" + (int)result + ").";
         }
+    }
+}
+
+public static class GameRoomRules
+{
+    public const int MaxRoomNameLength = 20;
+    public const int MaxPlayersPerRoom = 2;
+
+    static readonly Regex validRoomName = new Regex("^[A-Za-z0-9_ ]{1," + MaxRoomNameLength + "}$");
+
+    public static AccountResult Validate(string roomName)
+    {
+        if (string.IsNullOrWhiteSpace(roomName) || !validRoomName.IsMatch(roomName))
+            return AccountResult.RoomNameInvalid;
+        return AccountResult.Success;
     }
 }
