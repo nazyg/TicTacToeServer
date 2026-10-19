@@ -22,8 +22,7 @@ public class NetworkServer : MonoBehaviour
     Dictionary<int, NetworkConnection> connectionById = new Dictionary<int, NetworkConnection>();
     int nextConnectionId = 1;
 
-    AccountManager accountManager;
-    GameRoomManager gameRoomManager;
+    NetworkServerProcessing networkServerProcessing;
 
     void Start()
     {
@@ -41,8 +40,7 @@ public class NetworkServer : MonoBehaviour
 
         networkConnections = new NativeList<NetworkConnection>(MaxNumberOfClientConnections, Allocator.Persistent);
 
-        accountManager = new AccountManager(Path.Combine(Application.persistentDataPath, "Accounts.txt"));
-        gameRoomManager = new GameRoomManager(SendMessageToClient, accountManager.GetAccountName);
+        networkServerProcessing = new NetworkServerProcessing(SendMessageToClient, Path.Combine(Application.persistentDataPath, "Accounts.txt"));
     }
 
     void OnDestroy()
@@ -102,7 +100,7 @@ public class NetworkServer : MonoBehaviour
                         streamReader.ReadBytes(buffer);
                         byte[] byteBuffer = buffer.ToArray();
                         string msg = Encoding.Unicode.GetString(byteBuffer);
-                        ProcessReceivedMsg(msg, connectionIdByConnection[networkConnections[i]]);
+                        networkServerProcessing.ReceivedMessageFromClient(msg, connectionIdByConnection[networkConnections[i]]);
                         buffer.Dispose();
                         break;
                     case NetworkEvent.Type.Disconnect:
@@ -146,63 +144,9 @@ public class NetworkServer : MonoBehaviour
             return;
 
         Debug.Log("Client with connection ID " + connectionId + " has disconnected from server");
-        gameRoomManager.OnClientDisconnectedOrLoggedOut(connectionId);
-        accountManager.OnClientDisconnected(connectionId);
+        networkServerProcessing.OnClientDisconnected(connectionId);
         connectionIdByConnection.Remove(connection);
         connectionById.Remove(connectionId);
-    }
-
-    private void ProcessReceivedMsg(string msg, int connectionId)
-    {
-        Debug.Log("Msg received from connection " + connectionId + " = " + msg);
-
-        string[] values = msg.Split(NetworkMessageFormat.Separator);
-        if (!int.TryParse(values[0], out int signifier))
-        {
-            Debug.LogWarning("Could not read signifier of msg: " + msg);
-            return;
-        }
-
-        switch (signifier)
-        {
-            case ClientToServerSignifiers.CreateAccount:
-            {
-                AccountResult result = values.Length == 3
-                    ? accountManager.CreateAccount(values[1], values[2])
-                    : AccountResult.MalformedMessage;
-                string name = values.Length > 1 ? values[1] : "";
-                SendMessageToClient(ServerToClientSignifiers.CreateAccountResult + "," + (int)result + "," + name, connectionId);
-                break;
-            }
-            case ClientToServerSignifiers.Login:
-            {
-                string accountName = values.Length > 1 ? values[1] : "";
-                AccountResult result = values.Length == 3
-                    ? accountManager.Login(connectionId, values[1], values[2], out accountName)
-                    : AccountResult.MalformedMessage;
-                SendMessageToClient(ServerToClientSignifiers.LoginResult + "," + (int)result + "," + accountName, connectionId);
-                break;
-            }
-            case ClientToServerSignifiers.Logout:
-            {
-                gameRoomManager.OnClientDisconnectedOrLoggedOut(connectionId);
-                AccountResult result = accountManager.Logout(connectionId);
-                SendMessageToClient(ServerToClientSignifiers.LogoutResult + "," + (int)result, connectionId);
-                break;
-            }
-            case ClientToServerSignifiers.JoinOrCreateGameRoom:
-                gameRoomManager.JoinOrCreate(connectionId, values.Length == 2 ? values[1] : null);
-                break;
-            case ClientToServerSignifiers.LeaveGameRoom:
-                gameRoomManager.Leave(connectionId);
-                break;
-            case ClientToServerSignifiers.SendMessageToOpponent:
-                gameRoomManager.SendMessageToOpponent(connectionId, values.Length > 1 ? string.Join(",", values, 1, values.Length - 1) : "");
-                break;
-            default:
-                Debug.LogWarning("Unknown signifier " + signifier + " from connection " + connectionId);
-                break;
-        }
     }
 
     public void SendMessageToClient(string msg, int connectionId)

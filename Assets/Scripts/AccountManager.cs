@@ -29,14 +29,14 @@ public class AccountManager
 
     #region Account Creation / Login / Logout
 
-    public AccountResult CreateAccount(string name, string password)
+    public ResultCode CreateAccount(string name, string password)
     {
-        AccountResult validation = AccountRules.Validate(name, password);
-        if (validation != AccountResult.Success)
+        ResultCode validation = AccountRules.Validate(name, password);
+        if (validation != ResultCode.Success)
             return validation;
 
         if (accountsByName.ContainsKey(name))
-            return AccountResult.NameTaken;
+            return ResultCode.NameTaken;
 
         string salt = CreateSalt();
         Account account = new Account { name = name, salt = salt, passwordHash = HashPassword(password, salt) };
@@ -44,45 +44,45 @@ public class AccountManager
         SaveAccounts();
 
         Debug.Log("Account created: " + name);
-        return AccountResult.Success;
+        return ResultCode.Success;
     }
 
-    public AccountResult Login(int connectionId, string name, string password, out string accountName)
+    public ResultCode Login(int connectionId, string name, string password, out string accountName)
     {
         accountName = name;
 
-        AccountResult validation = AccountRules.Validate(name, password);
-        if (validation != AccountResult.Success)
+        ResultCode validation = AccountRules.Validate(name, password);
+        if (validation != ResultCode.Success)
             return validation;
 
         if (accountNameByConnectionId.ContainsKey(connectionId))
-            return AccountResult.AlreadyLoggedInOnThisConnection;
+            return ResultCode.AlreadyLoggedInOnThisConnection;
 
         if (!accountsByName.TryGetValue(name, out Account account))
-            return AccountResult.AccountNotFound;
+            return ResultCode.AccountNotFound;
 
         if (HashPassword(password, account.salt) != account.passwordHash)
-            return AccountResult.WrongPassword;
+            return ResultCode.WrongPassword;
 
         if (accountNameByConnectionId.ContainsValue(account.name))
-            return AccountResult.AlreadyLoggedIn;
+            return ResultCode.AlreadyLoggedIn;
 
         // Associate the client's connection ID with the account.
         accountNameByConnectionId.Add(connectionId, account.name);
         accountName = account.name;
 
         Debug.Log("Connection " + connectionId + " is now associated with account '" + account.name + "'");
-        return AccountResult.Success;
+        return ResultCode.Success;
     }
 
-    public AccountResult Logout(int connectionId)
+    public ResultCode Logout(int connectionId)
     {
         if (!accountNameByConnectionId.TryGetValue(connectionId, out string name))
-            return AccountResult.NotLoggedIn;
+            return ResultCode.NotLoggedIn;
 
         accountNameByConnectionId.Remove(connectionId);
         Debug.Log("Connection " + connectionId + " logged out of account '" + name + "'");
-        return AccountResult.Success;
+        return ResultCode.Success;
     }
 
     public void OnClientDisconnected(int connectionId)

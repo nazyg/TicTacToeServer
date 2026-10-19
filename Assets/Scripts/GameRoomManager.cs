@@ -6,6 +6,8 @@ public class GameRoom
 {
     public string name;
     public List<int> playerConnectionIds = new List<int>();
+    public TicTacToeBoard board = new TicTacToeBoard();
+    public HashSet<int> rematchRequests = new HashSet<int>();
 
     public bool IsFull => playerConnectionIds.Count >= GameRoomRules.MaxPlayersPerRoom;
 
@@ -18,12 +20,24 @@ public class GameRoom
         }
         return -1;
     }
+
+    public TicTacToeMark GetMark(int connectionId)
+    {
+        int index = playerConnectionIds.IndexOf(connectionId);
+        if (index == 0)
+            return TicTacToeMark.X;
+        if (index == 1)
+            return TicTacToeMark.O;
+        return TicTacToeMark.None;
+    }
 }
 
 public class GameRoomManager
 {
     readonly Dictionary<string, GameRoom> roomsByName = new Dictionary<string, GameRoom>(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<int, GameRoom> roomByConnectionId = new Dictionary<int, GameRoom>();
+
+    const int MaxChatMessageLength = 100;
 
     readonly Action<string, int> sendMessageToClient;
     readonly Func<int, string> getAccountName;
@@ -36,8 +50,8 @@ public class GameRoomManager
 
     public void JoinOrCreate(int connectionId, string roomName)
     {
-        AccountResult result = CheckCanJoin(connectionId, roomName);
-        if (result != AccountResult.Success)
+        ResultCode result = CheckCanJoin(connectionId, roomName);
+        if (result != ResultCode.Success)
         {
             sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)result, connectionId);
             return;
@@ -62,35 +76,102 @@ public class GameRoomManager
         }
 
         Debug.Log("Game room '" + room.name + "' is full, starting game");
+        room.board.Reset();
+        room.rematchRequests.Clear();
         foreach (int playerId in room.playerConnectionIds)
         {
             string opponentName = getAccountName(room.GetOpponent(playerId));
-            sendMessageToClient(ServerToClientSignifiers.GameStarted + "," + room.name + "," + opponentName, playerId);
+            sendMessageToClient(ServerToClientSignifiers.GameStarted + "," + room.name + "," + opponentName + "," + (int)room.GetMark(playerId), playerId);
         }
+        SendBoardToRoom(room);
     }
 
-    AccountResult CheckCanJoin(int connectionId, string roomName)
+    public void PlaceMark(int connectionId, int cellIndex)
+    {
+        ResultCode result = CheckCanPlaceMark(connectionId, cellIndex, out GameRoom room);
+        if (result != ResultCode.Success)
+        {
+            sendMessageToClient(ServerToClientSignifiers.MoveRejected + "," + (int)result, connectionId);
+            return;
+        }
+
+        room.board.TryPlaceMark(cellIndex);
+        Debug.Log(getAccountName(connectionId) + " placed " + room.GetMark(connectionId) + " on cell " + cellIndex + " in room '" + room.name + "'");
+
+        if (room.board.Result != TicTacToeResult.InProgress)
+            Debug.Log("Game in room '" + room.name + "' ended: " + room.board.Result);
+
+        SendBoardToRoom(room);
+    }
+
+    ResultCode CheckCanPlaceMark(int connectionId, int cellIndex, out GameRoom room)
+    {
+        if (!roomByConnectionId.TryGetValue(connectionId, out room) || !room.IsFull)
+            return ResultCode.NotInGameRoom;
+        if (room.board.Result != TicTacToeResult.InProgress)
+            return ResultCode.GameOver;
+        if (room.board.CurrentTurn != room.GetMark(connectionId))
+            return ResultCode.NotYourTurn;
+        if (!room.board.CanPlaceMark(cellIndex))
+            return ResultCode.CellOccupied;
+        return ResultCode.Success;
+    }
+
+    public void RequestRematch(int connectionId)
+    {
+        if (!roomByConnectionId.TryGetValue(connectionId, out GameRoom room) || !room.IsFull)
+        {
+            sendMessageToClient(ServerToClientSignifiers.MoveRejected + "," + (int)ResultCode.NotInGameRoom, connectionId);
+            return;
+        }
+        if (room.board.Result == TicTacToeResult.InProgress)
+        {
+            sendMessageToClient(ServerToClientSignifiers.MoveRejected + "," + (int)ResultCode.GameNotOver, connectionId);
+            return;
+        }
+
+        room.rematchRequests.Add(connectionId);
+        if (room.rematchRequests.Count < GameRoomRules.MaxPlayersPerRoom)
+        {
+            sendMessageToClient(ServerToClientSignifiers.OpponentWantsRematch + "," + getAccountName(connectionId), room.GetOpponent(connectionId));
+            return;
+        }
+
+        Debug.Log("Rematch in room '" + room.name + "'");
+        room.rematchRequests.Clear();
+        room.board.Reset();
+        SendBoardToRoom(room);
+    }
+
+    void SendBoardToRoom(GameRoom room)
+    {
+        string msg = ServerToClientSignifiers.BoardUpdate + "," + room.board.Serialize();
+        foreach (int playerId in room.playerConnectionIds)
+            sendMessageToClient(msg, playerId);
+    }
+
+    ResultCode CheckCanJoin(int connectionId, string roomName)
     {
         if (getAccountName(connectionId) == null)
-            return AccountResult.NotLoggedIn;
+            return ResultCode.NotLoggedIn;
         if (roomByConnectionId.ContainsKey(connectionId))
-            return AccountResult.AlreadyInGameRoom;
+            return ResultCode.AlreadyInGameRoom;
 
-        AccountResult validation = GameRoomRules.Validate(roomName == null ? null : roomName.Trim());
-        if (validation != AccountResult.Success)
+        ResultCode validation = GameRoomRules.Validate(roomName == null ? null : roomName.Trim());
+        if (validation != ResultCode.Success)
             return validation;
 
         if (roomsByName.TryGetValue(roomName.Trim(), out GameRoom room) && room.IsFull)
-            return AccountResult.RoomFull;
+            return ResultCode.RoomFull;
 
-        return AccountResult.Success;
+        return ResultCode.Success;
     }
 
     public void Leave(int connectionId)
     {
         if (!roomByConnectionId.TryGetValue(connectionId, out GameRoom room))
         {
-            sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)AccountResult.NotInGameRoom, connectionId);
+            sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)ResultCode.NotInGameRoom, connectionId);
             return;
         }
 
@@ -126,9 +207,15 @@ public class GameRoomManager
     {
         if (!roomByConnectionId.TryGetValue(connectionId, out GameRoom room) || !room.IsFull)
         {
-            sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)AccountResult.NotInGameRoom, connectionId);
+            sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)ResultCode.NotInGameRoom, connectionId);
             return;
         }
+
+        text = text.Replace("\n", " ").Replace("\r", " ").Trim();
+        if (text.Length == 0)
+            return;
+        if (text.Length > MaxChatMessageLength)
+            text = text.Substring(0, MaxChatMessageLength);
 
         int opponentId = room.GetOpponent(connectionId);
         string senderName = getAccountName(connectionId);
