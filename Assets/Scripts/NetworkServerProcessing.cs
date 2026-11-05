@@ -14,77 +14,104 @@ public class NetworkServerProcessing
         gameRoomManager = new GameRoomManager(sendMessageToClient, accountManager.GetAccountName);
     }
 
-    public void ReceivedMessageFromClient(string msg, int connectionId)
+    public void ReceivedMessageFromClient(string rawMessage, int connectionId)
     {
-        Debug.Log("Msg received from connection " + connectionId + " = " + msg);
+        Debug.Log("Msg received from connection " + connectionId + " = " + rawMessage);
 
-        string[] values = msg.Split(NetworkMessageFormat.Separator);
-        if (!int.TryParse(values[0], out int signifier))
+        NetworkMessage message = NetworkMessage.Parse(rawMessage);
+        if (!message.IsValid)
         {
-            Debug.LogWarning("Could not read signifier of msg: " + msg);
+            Debug.LogWarning("Could not read signifier of msg: " + rawMessage);
             return;
         }
 
-        switch (signifier)
+        switch (message.Signifier)
         {
             case ClientToServerSignifiers.CreateAccount:
-            {
-                ResultCode result = values.Length == 3
-                    ? accountManager.CreateAccount(values[1], values[2])
-                    : ResultCode.MalformedMessage;
-                string name = values.Length > 1 ? values[1] : "";
-                sendMessageToClient(ServerToClientSignifiers.CreateAccountResult + "," + (int)result + "," + name, connectionId);
+                HandleCreateAccount(message, connectionId);
                 break;
-            }
             case ClientToServerSignifiers.Login:
-            {
-                string accountName = values.Length > 1 ? values[1] : "";
-                ResultCode result = values.Length == 3
-                    ? accountManager.Login(connectionId, values[1], values[2], out accountName)
-                    : ResultCode.MalformedMessage;
-                sendMessageToClient(ServerToClientSignifiers.LoginResult + "," + (int)result + "," + accountName, connectionId);
+                HandleLogin(message, connectionId);
                 break;
-            }
             case ClientToServerSignifiers.Logout:
-            {
-                gameRoomManager.OnClientDisconnectedOrLoggedOut(connectionId);
-                ResultCode result = accountManager.Logout(connectionId);
-                sendMessageToClient(ServerToClientSignifiers.LogoutResult + "," + (int)result, connectionId);
+                HandleLogout(connectionId);
                 break;
-            }
             case ClientToServerSignifiers.JoinOrCreateGameRoom:
-                gameRoomManager.JoinOrCreate(connectionId, values.Length == 2 ? values[1] : null);
+                gameRoomManager.JoinOrCreate(connectionId, ReadRoomName(message));
                 break;
             case ClientToServerSignifiers.LeaveGameRoom:
                 gameRoomManager.Leave(connectionId);
                 break;
             case ClientToServerSignifiers.PlaceMark:
-                if (values.Length == 2 && int.TryParse(values[1], out int cellIndex))
-                    gameRoomManager.PlaceMark(connectionId, cellIndex);
-                else
-                    sendMessageToClient(ServerToClientSignifiers.MoveRejected + "," + (int)ResultCode.MalformedMessage, connectionId);
-                break;
-            case ClientToServerSignifiers.WatchGameRoom:
-                gameRoomManager.Watch(connectionId, values.Length == 2 ? values[1] : null);
-                break;
-            case ClientToServerSignifiers.StopWatching:
-                gameRoomManager.StopWatching(connectionId);
+                HandlePlaceMark(message, connectionId);
                 break;
             case ClientToServerSignifiers.RequestRematch:
                 gameRoomManager.RequestRematch(connectionId);
                 break;
-            case ClientToServerSignifiers.SendMessageToOpponent:
-                gameRoomManager.SendMessageToOpponent(connectionId, values.Length > 1 ? string.Join(",", values, 1, values.Length - 1) : "");
+            case ClientToServerSignifiers.WatchGameRoom:
+                gameRoomManager.Watch(connectionId, ReadRoomName(message));
+                break;
+            case ClientToServerSignifiers.StopWatching:
+                gameRoomManager.StopWatching(connectionId);
+                break;
+            case ClientToServerSignifiers.SendChatMessage:
+                gameRoomManager.SendChatMessage(connectionId, message.GetRemainingText(0));
                 break;
             default:
-                Debug.LogWarning("Unknown signifier " + signifier + " from connection " + connectionId);
+                Debug.LogWarning("Unknown signifier " + message.Signifier + " from connection " + connectionId);
                 break;
         }
     }
 
     public void OnClientDisconnected(int connectionId)
     {
-        gameRoomManager.OnClientDisconnectedOrLoggedOut(connectionId);
-        accountManager.OnClientDisconnected(connectionId);
+        gameRoomManager.RemoveConnection(connectionId);
+        accountManager.Logout(connectionId);
+    }
+
+    void HandleCreateAccount(NetworkMessage message, int connectionId)
+    {
+        string name = message.GetString(0);
+        ResultCode result = message.ValueCount == 2
+            ? accountManager.CreateAccount(name, message.GetString(1))
+            : ResultCode.MalformedMessage;
+
+        Send(connectionId, ServerToClientSignifiers.CreateAccountResult, result, name);
+    }
+
+    void HandleLogin(NetworkMessage message, int connectionId)
+    {
+        string accountName = message.GetString(0);
+        ResultCode result = message.ValueCount == 2
+            ? accountManager.Login(connectionId, accountName, message.GetString(1), out accountName)
+            : ResultCode.MalformedMessage;
+
+        Send(connectionId, ServerToClientSignifiers.LoginResult, result, accountName);
+    }
+
+    void HandleLogout(int connectionId)
+    {
+        gameRoomManager.RemoveConnection(connectionId);
+        ResultCode result = accountManager.Logout(connectionId);
+        Send(connectionId, ServerToClientSignifiers.LogoutResult, result);
+    }
+
+    void HandlePlaceMark(NetworkMessage message, int connectionId)
+    {
+        if (message.TryGetInt(0, out int cellIndex))
+            gameRoomManager.PlaceMark(connectionId, cellIndex);
+        else
+            Send(connectionId, ServerToClientSignifiers.MoveRejected, ResultCode.MalformedMessage);
+    }
+
+    // Room names can't contain the separator, so a message with extra values is treated as an invalid name.
+    static string ReadRoomName(NetworkMessage message)
+    {
+        return message.ValueCount == 1 ? message.GetString(0) : null;
+    }
+
+    void Send(int connectionId, int signifier, params object[] values)
+    {
+        sendMessageToClient(NetworkMessage.Build(signifier, values), connectionId);
     }
 }

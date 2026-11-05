@@ -1,45 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
-
-public class GameRoom
-{
-    public string name;
-    public List<int> playerConnectionIds = new List<int>();
-    public TicTacToeBoard board = new TicTacToeBoard();
-    public HashSet<int> rematchRequests = new HashSet<int>();
-    public List<int> observerConnectionIds = new List<int>();
-
-    public bool IsFull => playerConnectionIds.Count >= GameRoomRules.MaxPlayersPerRoom;
-
-    public int GetOpponent(int connectionId)
-    {
-        foreach (int id in playerConnectionIds)
-        {
-            if (id != connectionId)
-                return id;
-        }
-        return -1;
-    }
-
-    public TicTacToeMark GetMark(int connectionId)
-    {
-        int index = playerConnectionIds.IndexOf(connectionId);
-        if (index == 0)
-            return TicTacToeMark.X;
-        if (index == 1)
-            return TicTacToeMark.O;
-        return TicTacToeMark.None;
-    }
-}
 
 public class GameRoomManager
 {
     readonly Dictionary<string, GameRoom> roomsByName = new Dictionary<string, GameRoom>(StringComparer.OrdinalIgnoreCase);
-    readonly Dictionary<int, GameRoom> roomByConnectionId = new Dictionary<int, GameRoom>();
+    readonly Dictionary<int, GameRoom> roomByPlayerId = new Dictionary<int, GameRoom>();
     readonly Dictionary<int, GameRoom> roomByObserverId = new Dictionary<int, GameRoom>();
-
-    const int MaxChatMessageLength = 100;
 
     readonly Action<string, int> sendMessageToClient;
     readonly Func<int, string> getAccountName;
@@ -50,247 +18,270 @@ public class GameRoomManager
         this.getAccountName = getAccountName;
     }
 
+    #region Joining and Leaving
+
     public void JoinOrCreate(int connectionId, string roomName)
     {
+        roomName = GameRoomRules.Normalize(roomName);
         ResultCode result = CheckCanJoin(connectionId, roomName);
         if (result != ResultCode.Success)
         {
-            sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)result, connectionId);
+            Send(connectionId, ServerToClientSignifiers.GameRoomError, result);
             return;
         }
 
-        roomName = roomName.Trim();
+        GameRoom room = GetOrCreateRoom(roomName, connectionId);
+        room.AddPlayer(connectionId);
+        roomByPlayerId.Add(connectionId, room);
 
-        if (!roomsByName.TryGetValue(roomName, out GameRoom room))
-        {
-            room = new GameRoom { name = roomName };
-            roomsByName.Add(roomName, room);
-            Debug.Log("Game room '" + roomName + "' created by connection " + connectionId);
-        }
-
-        room.playerConnectionIds.Add(connectionId);
-        roomByConnectionId.Add(connectionId, room);
-
-        if (!room.IsFull)
-        {
-            sendMessageToClient(ServerToClientSignifiers.WaitingForOpponent + "," + room.name, connectionId);
-            return;
-        }
-
-        Debug.Log("Game room '" + room.name + "' is full, starting game");
-        room.board.Reset();
-        room.rematchRequests.Clear();
-        foreach (int playerId in room.playerConnectionIds)
-        {
-            string opponentName = getAccountName(room.GetOpponent(playerId));
-            sendMessageToClient(ServerToClientSignifiers.GameStarted + "," + room.name + "," + opponentName + "," + (int)room.GetMark(playerId), playerId);
-        }
-        SendBoardToRoom(room);
+        if (room.IsFull)
+            StartGame(room);
+        else
+            Send(connectionId, ServerToClientSignifiers.WaitingForOpponent, room.Name);
     }
+
+    public void Leave(int connectionId)
+    {
+        if (!roomByPlayerId.TryGetValue(connectionId, out GameRoom room))
+        {
+            Send(connectionId, ServerToClientSignifiers.GameRoomError, ResultCode.NotInGameRoom);
+            return;
+        }
+
+        CloseRoomBecausePlayerLeft(room, connectionId);
+        Send(connectionId, ServerToClientSignifiers.LeftGameRoom);
+    }
+
+    public void RemoveConnection(int connectionId)
+    {
+        if (roomByPlayerId.TryGetValue(connectionId, out GameRoom room))
+            CloseRoomBecausePlayerLeft(room, connectionId);
+        else if (roomByObserverId.TryGetValue(connectionId, out GameRoom watchedRoom))
+            RemoveObserver(watchedRoom, connectionId);
+    }
+
+    ResultCode CheckCanJoin(int connectionId, string roomName)
+    {
+        ResultCode result = CheckCanEnterAnyRoom(connectionId, roomName);
+        if (result != ResultCode.Success)
+            return result;
+        if (roomsByName.TryGetValue(roomName, out GameRoom room) && room.IsFull)
+            return ResultCode.RoomFull;
+        return ResultCode.Success;
+    }
+
+    ResultCode CheckCanEnterAnyRoom(int connectionId, string roomName)
+    {
+        if (getAccountName(connectionId) == null)
+            return ResultCode.NotLoggedIn;
+        if (IsInAnyRoom(connectionId))
+            return ResultCode.AlreadyInGameRoom;
+        return GameRoomRules.Validate(roomName);
+    }
+
+    bool IsInAnyRoom(int connectionId)
+    {
+        return roomByPlayerId.ContainsKey(connectionId) || roomByObserverId.ContainsKey(connectionId);
+    }
+
+    GameRoom GetOrCreateRoom(string roomName, int creatorId)
+    {
+        if (roomsByName.TryGetValue(roomName, out GameRoom room))
+            return room;
+
+        room = new GameRoom(roomName);
+        roomsByName.Add(roomName, room);
+        Debug.Log("Game room '" + roomName + "' created by connection " + creatorId);
+        return room;
+    }
+
+    void CloseRoomBecausePlayerLeft(GameRoom room, int leavingPlayerId)
+    {
+        string leavingPlayerName = getAccountName(leavingPlayerId);
+        room.RemovePlayer(leavingPlayerId);
+        roomByPlayerId.Remove(leavingPlayerId);
+        Debug.Log("Connection " + leavingPlayerId + " left game room '" + room.Name + "'");
+
+        foreach (int remainingId in room.EveryoneInRoom.ToList())
+        {
+            roomByPlayerId.Remove(remainingId);
+            roomByObserverId.Remove(remainingId);
+            Send(remainingId, ServerToClientSignifiers.PlayerLeftGameRoom, leavingPlayerName);
+        }
+
+        roomsByName.Remove(room.Name);
+        Debug.Log("Game room '" + room.Name + "' closed");
+    }
+
+    #endregion
+
+    #region Playing
 
     public void PlaceMark(int connectionId, int cellIndex)
     {
         ResultCode result = CheckCanPlaceMark(connectionId, cellIndex, out GameRoom room);
         if (result != ResultCode.Success)
         {
-            sendMessageToClient(ServerToClientSignifiers.MoveRejected + "," + (int)result, connectionId);
+            Send(connectionId, ServerToClientSignifiers.MoveRejected, result);
             return;
         }
 
-        room.board.TryPlaceMark(cellIndex);
-        Debug.Log(getAccountName(connectionId) + " placed " + room.GetMark(connectionId) + " on cell " + cellIndex + " in room '" + room.name + "'");
+        room.Board.TryPlaceMark(cellIndex);
+        Debug.Log(getAccountName(connectionId) + " placed " + room.GetMark(connectionId) + " on cell " + cellIndex + " in room '" + room.Name + "'");
+        if (!room.Board.IsInProgress)
+            Debug.Log("Game in room '" + room.Name + "' ended: " + room.Board.Result);
 
-        if (room.board.Result != TicTacToeResult.InProgress)
-            Debug.Log("Game in room '" + room.name + "' ended: " + room.board.Result);
-
-        SendBoardToRoom(room);
-    }
-
-    ResultCode CheckCanPlaceMark(int connectionId, int cellIndex, out GameRoom room)
-    {
-        if (!roomByConnectionId.TryGetValue(connectionId, out room) || !room.IsFull)
-            return ResultCode.NotInGameRoom;
-        if (room.board.Result != TicTacToeResult.InProgress)
-            return ResultCode.GameOver;
-        if (room.board.CurrentTurn != room.GetMark(connectionId))
-            return ResultCode.NotYourTurn;
-        if (!room.board.CanPlaceMark(cellIndex))
-            return ResultCode.CellOccupied;
-        return ResultCode.Success;
+        SendBoardToEveryone(room);
     }
 
     public void RequestRematch(int connectionId)
     {
-        if (!roomByConnectionId.TryGetValue(connectionId, out GameRoom room) || !room.IsFull)
+        ResultCode result = CheckCanRequestRematch(connectionId, out GameRoom room);
+        if (result != ResultCode.Success)
         {
-            sendMessageToClient(ServerToClientSignifiers.MoveRejected + "," + (int)ResultCode.NotInGameRoom, connectionId);
-            return;
-        }
-        if (room.board.Result == TicTacToeResult.InProgress)
-        {
-            sendMessageToClient(ServerToClientSignifiers.MoveRejected + "," + (int)ResultCode.GameNotOver, connectionId);
+            Send(connectionId, ServerToClientSignifiers.MoveRejected, result);
             return;
         }
 
-        room.rematchRequests.Add(connectionId);
-        if (room.rematchRequests.Count < GameRoomRules.MaxPlayersPerRoom)
+        bool everyoneAgreed = room.AddRematchRequest(connectionId);
+        if (!everyoneAgreed)
         {
-            sendMessageToClient(ServerToClientSignifiers.OpponentWantsRematch + "," + getAccountName(connectionId), room.GetOpponent(connectionId));
+            Send(room.GetOpponent(connectionId), ServerToClientSignifiers.OpponentWantsRematch, getAccountName(connectionId));
             return;
         }
 
-        Debug.Log("Rematch in room '" + room.name + "'");
-        room.rematchRequests.Clear();
-        room.board.Reset();
-        SendBoardToRoom(room);
+        Debug.Log("Rematch in room '" + room.Name + "'");
+        room.StartNewGame();
+        SendBoardToEveryone(room);
     }
 
-    void SendBoardToRoom(GameRoom room)
+    public void SendChatMessage(int connectionId, string text)
     {
-        string msg = ServerToClientSignifiers.BoardUpdate + "," + room.board.Serialize();
-        foreach (int playerId in room.playerConnectionIds)
-            sendMessageToClient(msg, playerId);
-        foreach (int observerId in room.observerConnectionIds)
-            sendMessageToClient(msg, observerId);
+        if (!TryGetFullRoom(connectionId, out GameRoom room))
+        {
+            Send(connectionId, ServerToClientSignifiers.GameRoomError, ResultCode.NotInGameRoom);
+            return;
+        }
+
+        text = ChatRules.Sanitize(text);
+        if (text.Length == 0)
+            return;
+
+        int opponentId = room.GetOpponent(connectionId);
+        string senderName = getAccountName(connectionId);
+        Debug.Log("Piping msg from " + senderName + " to connection " + opponentId + ": " + text);
+        Send(opponentId, ServerToClientSignifiers.ChatMessage, senderName, text);
     }
 
-    ResultCode CheckCanJoin(int connectionId, string roomName)
+    void StartGame(GameRoom room)
     {
-        if (getAccountName(connectionId) == null)
-            return ResultCode.NotLoggedIn;
-        if (roomByConnectionId.ContainsKey(connectionId) || roomByObserverId.ContainsKey(connectionId))
-            return ResultCode.AlreadyInGameRoom;
+        Debug.Log("Game room '" + room.Name + "' is full, starting game");
+        room.StartNewGame();
 
-        ResultCode validation = GameRoomRules.Validate(roomName == null ? null : roomName.Trim());
-        if (validation != ResultCode.Success)
-            return validation;
+        foreach (int playerId in room.PlayerIds)
+        {
+            string opponentName = getAccountName(room.GetOpponent(playerId));
+            Send(playerId, ServerToClientSignifiers.GameStarted, room.Name, opponentName, room.GetMark(playerId));
+        }
+        SendBoardToEveryone(room);
+    }
 
-        if (roomsByName.TryGetValue(roomName.Trim(), out GameRoom room) && room.IsFull)
-            return ResultCode.RoomFull;
-
+    ResultCode CheckCanPlaceMark(int connectionId, int cellIndex, out GameRoom room)
+    {
+        if (!TryGetFullRoom(connectionId, out room))
+            return ResultCode.NotInGameRoom;
+        if (!room.Board.IsInProgress)
+            return ResultCode.GameOver;
+        if (room.Board.CurrentTurn != room.GetMark(connectionId))
+            return ResultCode.NotYourTurn;
+        if (!room.Board.CanPlaceMark(cellIndex))
+            return ResultCode.CellOccupied;
         return ResultCode.Success;
     }
 
-    public void Leave(int connectionId)
+    ResultCode CheckCanRequestRematch(int connectionId, out GameRoom room)
     {
-        if (!roomByConnectionId.TryGetValue(connectionId, out GameRoom room))
-        {
-            sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)ResultCode.NotInGameRoom, connectionId);
-            return;
-        }
-
-        RemoveFromRoom(connectionId, room);
-        sendMessageToClient(ServerToClientSignifiers.LeftGameRoom.ToString(), connectionId);
+        if (!TryGetFullRoom(connectionId, out room))
+            return ResultCode.NotInGameRoom;
+        if (room.Board.IsInProgress)
+            return ResultCode.GameNotOver;
+        return ResultCode.Success;
     }
 
-    public void OnClientDisconnectedOrLoggedOut(int connectionId)
+    bool TryGetFullRoom(int playerId, out GameRoom room)
     {
-        if (roomByConnectionId.TryGetValue(connectionId, out GameRoom room))
-            RemoveFromRoom(connectionId, room);
-        else if (roomByObserverId.TryGetValue(connectionId, out GameRoom watchedRoom))
-            RemoveObserver(connectionId, watchedRoom);
+        return roomByPlayerId.TryGetValue(playerId, out room) && room.IsFull;
     }
+
+    void SendBoardToEveryone(GameRoom room)
+    {
+        foreach (int connectionId in room.EveryoneInRoom)
+            SendBoard(connectionId, room);
+    }
+
+    void SendBoard(int connectionId, GameRoom room)
+    {
+        Send(connectionId, ServerToClientSignifiers.BoardUpdate, room.Board.Serialize());
+    }
+
+    #endregion
+
+    #region Observing
 
     public void Watch(int connectionId, string roomName)
     {
+        roomName = GameRoomRules.Normalize(roomName);
         ResultCode result = CheckCanWatch(connectionId, roomName, out GameRoom room);
         if (result != ResultCode.Success)
         {
-            sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)result, connectionId);
+            Send(connectionId, ServerToClientSignifiers.GameRoomError, result);
             return;
         }
 
-        room.observerConnectionIds.Add(connectionId);
+        room.AddObserver(connectionId);
         roomByObserverId.Add(connectionId, room);
-        Debug.Log(getAccountName(connectionId) + " is now watching game room '" + room.name + "'");
+        Debug.Log(getAccountName(connectionId) + " is now watching game room '" + room.Name + "'");
 
-        string playerXName = getAccountName(room.playerConnectionIds[0]);
-        string playerOName = getAccountName(room.playerConnectionIds[1]);
-        sendMessageToClient(ServerToClientSignifiers.ObservingStarted + "," + room.name + "," + playerXName + "," + playerOName, connectionId);
-        sendMessageToClient(ServerToClientSignifiers.BoardUpdate + "," + room.board.Serialize(), connectionId);
-    }
-
-    ResultCode CheckCanWatch(int connectionId, string roomName, out GameRoom room)
-    {
-        room = null;
-        if (getAccountName(connectionId) == null)
-            return ResultCode.NotLoggedIn;
-        if (roomByConnectionId.ContainsKey(connectionId) || roomByObserverId.ContainsKey(connectionId))
-            return ResultCode.AlreadyInGameRoom;
-
-        ResultCode validation = GameRoomRules.Validate(roomName == null ? null : roomName.Trim());
-        if (validation != ResultCode.Success)
-            return validation;
-
-        if (!roomsByName.TryGetValue(roomName.Trim(), out room))
-            return ResultCode.RoomNotFound;
-        if (!room.IsFull)
-            return ResultCode.GameNotStarted;
-
-        return ResultCode.Success;
+        Send(connectionId, ServerToClientSignifiers.ObservingStarted, room.Name, getAccountName(room.PlayerXId), getAccountName(room.PlayerOId));
+        SendBoard(connectionId, room);
     }
 
     public void StopWatching(int connectionId)
     {
         if (!roomByObserverId.TryGetValue(connectionId, out GameRoom room))
         {
-            sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)ResultCode.NotWatching, connectionId);
+            Send(connectionId, ServerToClientSignifiers.GameRoomError, ResultCode.NotWatching);
             return;
         }
 
-        RemoveObserver(connectionId, room);
-        sendMessageToClient(ServerToClientSignifiers.StoppedWatching.ToString(), connectionId);
+        RemoveObserver(room, connectionId);
+        Send(connectionId, ServerToClientSignifiers.StoppedWatching);
     }
 
-    void RemoveObserver(int connectionId, GameRoom room)
+    ResultCode CheckCanWatch(int connectionId, string roomName, out GameRoom room)
     {
-        room.observerConnectionIds.Remove(connectionId);
-        roomByObserverId.Remove(connectionId);
-        Debug.Log("Connection " + connectionId + " stopped watching game room '" + room.name + "'");
+        room = null;
+        ResultCode result = CheckCanEnterAnyRoom(connectionId, roomName);
+        if (result != ResultCode.Success)
+            return result;
+        if (!roomsByName.TryGetValue(roomName, out room))
+            return ResultCode.RoomNotFound;
+        if (!room.IsFull)
+            return ResultCode.GameNotStarted;
+        return ResultCode.Success;
     }
 
-    void RemoveFromRoom(int connectionId, GameRoom room)
+    void RemoveObserver(GameRoom room, int observerId)
     {
-        string leavingPlayerName = getAccountName(connectionId);
-
-        room.playerConnectionIds.Remove(connectionId);
-        roomByConnectionId.Remove(connectionId);
-        Debug.Log("Connection " + connectionId + " left game room '" + room.name + "'");
-
-        foreach (int remainingId in room.playerConnectionIds)
-        {
-            roomByConnectionId.Remove(remainingId);
-            sendMessageToClient(ServerToClientSignifiers.OpponentLeftGameRoom + "," + leavingPlayerName, remainingId);
-        }
-
-        foreach (int observerId in room.observerConnectionIds)
-        {
-            roomByObserverId.Remove(observerId);
-            sendMessageToClient(ServerToClientSignifiers.OpponentLeftGameRoom + "," + leavingPlayerName, observerId);
-        }
-        room.observerConnectionIds.Clear();
-
-        roomsByName.Remove(room.name);
-        Debug.Log("Game room '" + room.name + "' closed");
+        room.RemoveObserver(observerId);
+        roomByObserverId.Remove(observerId);
+        Debug.Log("Connection " + observerId + " stopped watching game room '" + room.Name + "'");
     }
 
-    public void SendMessageToOpponent(int connectionId, string text)
+    #endregion
+
+    void Send(int connectionId, int signifier, params object[] values)
     {
-        if (!roomByConnectionId.TryGetValue(connectionId, out GameRoom room) || !room.IsFull)
-        {
-            sendMessageToClient(ServerToClientSignifiers.GameRoomError + "," + (int)ResultCode.NotInGameRoom, connectionId);
-            return;
-        }
-
-        text = text.Replace("\n", " ").Replace("\r", " ").Trim();
-        if (text.Length == 0)
-            return;
-        if (text.Length > MaxChatMessageLength)
-            text = text.Substring(0, MaxChatMessageLength);
-
-        int opponentId = room.GetOpponent(connectionId);
-        string senderName = getAccountName(connectionId);
-        Debug.Log("Piping msg from " + senderName + " to connection " + opponentId + ": " + text);
-        sendMessageToClient(ServerToClientSignifiers.OpponentMessage + "," + senderName + "," + text, opponentId);
+        sendMessageToClient(NetworkMessage.Build(signifier, values), connectionId);
     }
 }

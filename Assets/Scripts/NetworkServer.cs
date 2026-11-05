@@ -1,25 +1,22 @@
-using UnityEngine;
-using UnityEngine.Assertions;
-using Unity.Collections;
-using Unity.Networking.Transport;
-using System.Text;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
+using Unity.Collections;
+using Unity.Networking.Transport;
+using UnityEngine;
 
 public class NetworkServer : MonoBehaviour
 {
-    public NetworkDriver networkDriver;
-    private NativeList<NetworkConnection> networkConnections;
-
-    NetworkPipeline reliableAndInOrderPipeline;
-    NetworkPipeline nonReliableNotInOrderedPipeline;
-
     const ushort NetworkPort = 9001;
-
     const int MaxNumberOfClientConnections = 1000;
+    const string AccountsFileName = "Accounts.txt";
 
-    Dictionary<NetworkConnection, int> connectionIdByConnection = new Dictionary<NetworkConnection, int>();
-    Dictionary<int, NetworkConnection> connectionById = new Dictionary<int, NetworkConnection>();
+    NetworkDriver networkDriver;
+    NativeList<NetworkConnection> networkConnections;
+    NetworkPipeline reliableAndInOrderPipeline;
+
+    readonly Dictionary<NetworkConnection, int> connectionIdByConnection = new Dictionary<NetworkConnection, int>();
+    readonly Dictionary<int, NetworkConnection> connectionById = new Dictionary<int, NetworkConnection>();
     int nextConnectionId = 1;
 
     NetworkServerProcessing networkServerProcessing;
@@ -28,19 +25,12 @@ public class NetworkServer : MonoBehaviour
     {
         networkDriver = NetworkDriver.Create();
         reliableAndInOrderPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage), typeof(ReliableSequencedPipelineStage));
-        nonReliableNotInOrderedPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage));
-        NetworkEndpoint endpoint = NetworkEndpoint.AnyIpv4;
-        endpoint.Port = NetworkPort;
-
-        int error = networkDriver.Bind(endpoint);
-        if (error != 0)
-            Debug.Log("Failed to bind to port " + NetworkPort);
-        else
-            networkDriver.Listen();
-
         networkConnections = new NativeList<NetworkConnection>(MaxNumberOfClientConnections, Allocator.Persistent);
 
-        networkServerProcessing = new NetworkServerProcessing(SendMessageToClient, Path.Combine(Application.persistentDataPath, "Accounts.txt"));
+        StartListening();
+
+        string accountsFilePath = Path.Combine(Application.persistentDataPath, AccountsFileName);
+        networkServerProcessing = new NetworkServerProcessing(SendMessageToClient, accountsFilePath);
     }
 
     void OnDestroy()
@@ -52,93 +42,99 @@ public class NetworkServer : MonoBehaviour
     void Update()
     {
         networkDriver.ScheduleUpdate().Complete();
+        RemoveClosedConnections();
+        AcceptNewConnections();
+        ProcessNetworkEvents();
+    }
 
-        #region Remove Unused Connections
+    public void SendMessageToClient(string message, int connectionId)
+    {
+        if (!connectionById.TryGetValue(connectionId, out NetworkConnection connection))
+            return;
 
-        for (int i = 0; i < networkConnections.Length; i++)
+        NativeArray<byte> buffer = new NativeArray<byte>(Encoding.Unicode.GetBytes(message), Allocator.Temp);
+        networkDriver.BeginSend(reliableAndInOrderPipeline, connection, out DataStreamWriter streamWriter);
+        streamWriter.WriteInt(buffer.Length);
+        streamWriter.WriteBytes(buffer);
+        networkDriver.EndSend(streamWriter);
+        buffer.Dispose();
+    }
+
+    void StartListening()
+    {
+        NetworkEndpoint endpoint = NetworkEndpoint.AnyIpv4;
+        endpoint.Port = NetworkPort;
+
+        if (networkDriver.Bind(endpoint) != 0)
+        {
+            Debug.LogError("Failed to bind to port " + NetworkPort);
+            return;
+        }
+
+        networkDriver.Listen();
+        Debug.Log("Server listening on port " + NetworkPort);
+    }
+
+    void RemoveClosedConnections()
+    {
+        for (int i = networkConnections.Length - 1; i >= 0; i--)
         {
             if (!networkConnections[i].IsCreated)
-            {
                 networkConnections.RemoveAtSwapBack(i);
-                i--;
-            }
         }
+    }
 
-        #endregion
-
-        #region Accept New Connections
-
-        while (AcceptIncomingConnection())
+    void AcceptNewConnections()
+    {
+        NetworkConnection connection;
+        while ((connection = networkDriver.Accept()) != default(NetworkConnection))
         {
+            networkConnections.Add(connection);
+
+            int connectionId = nextConnectionId++;
+            connectionIdByConnection.Add(connection, connectionId);
+            connectionById.Add(connectionId, connection);
+            Debug.Log("Accepted a client connection, connection ID = " + connectionId);
         }
+    }
 
-        #endregion
-
-        #region Manage Network Events
-
-        DataStreamReader streamReader;
-        NetworkPipeline pipelineUsedToSendEvent;
-        NetworkEvent.Type networkEventType;
-
+    void ProcessNetworkEvents()
+    {
         for (int i = 0; i < networkConnections.Length; i++)
         {
-            if (!networkConnections[i].IsCreated)
+            NetworkConnection connection = networkConnections[i];
+            if (!connection.IsCreated)
                 continue;
 
-            while (PopNetworkEventAndCheckForData(networkConnections[i], out networkEventType, out streamReader, out pipelineUsedToSendEvent))
+            NetworkEvent.Type eventType;
+            while ((eventType = connection.PopEvent(networkDriver, out DataStreamReader streamReader)) != NetworkEvent.Type.Empty)
             {
-                if (pipelineUsedToSendEvent == reliableAndInOrderPipeline)
-                    Debug.Log("Network event from: reliableAndInOrderPipeline");
-                else if (pipelineUsedToSendEvent == nonReliableNotInOrderedPipeline)
-                    Debug.Log("Network event from: nonReliableNotInOrderedPipeline");
-
-                switch (networkEventType)
+                if (eventType == NetworkEvent.Type.Data)
                 {
-                    case NetworkEvent.Type.Data:
-                        int sizeOfDataBuffer = streamReader.ReadInt();
-                        NativeArray<byte> buffer = new NativeArray<byte>(sizeOfDataBuffer, Allocator.Persistent);
-                        streamReader.ReadBytes(buffer);
-                        byte[] byteBuffer = buffer.ToArray();
-                        string msg = Encoding.Unicode.GetString(byteBuffer);
-                        networkServerProcessing.ReceivedMessageFromClient(msg, connectionIdByConnection[networkConnections[i]]);
-                        buffer.Dispose();
-                        break;
-                    case NetworkEvent.Type.Disconnect:
-                        OnClientDisconnected(networkConnections[i]);
-                        networkConnections[i] = default(NetworkConnection);
-                        break;
+                    string message = ReadMessage(ref streamReader);
+                    networkServerProcessing.ReceivedMessageFromClient(message, connectionIdByConnection[connection]);
+                }
+                else if (eventType == NetworkEvent.Type.Disconnect)
+                {
+                    OnClientDisconnected(connection);
+                    networkConnections[i] = default(NetworkConnection);
+                    break;
                 }
             }
         }
-
-        #endregion
     }
 
-    private bool AcceptIncomingConnection()
+    static string ReadMessage(ref DataStreamReader streamReader)
     {
-        NetworkConnection connection = networkDriver.Accept();
-        if (connection == default(NetworkConnection))
-            return false;
-
-        networkConnections.Add(connection);
-
-        int connectionId = nextConnectionId++;
-        connectionIdByConnection.Add(connection, connectionId);
-        connectionById.Add(connectionId, connection);
-        Debug.Log("Accepted a client connection, connection ID = " + connectionId);
-        return true;
+        int messageLength = streamReader.ReadInt();
+        NativeArray<byte> buffer = new NativeArray<byte>(messageLength, Allocator.Temp);
+        streamReader.ReadBytes(buffer);
+        string message = Encoding.Unicode.GetString(buffer.ToArray());
+        buffer.Dispose();
+        return message;
     }
 
-    private bool PopNetworkEventAndCheckForData(NetworkConnection networkConnection, out NetworkEvent.Type networkEventType, out DataStreamReader streamReader, out NetworkPipeline pipelineUsedToSendEvent)
-    {
-        networkEventType = networkConnection.PopEvent(networkDriver, out streamReader, out pipelineUsedToSendEvent);
-
-        if (networkEventType == NetworkEvent.Type.Empty)
-            return false;
-        return true;
-    }
-
-    private void OnClientDisconnected(NetworkConnection connection)
+    void OnClientDisconnected(NetworkConnection connection)
     {
         if (!connectionIdByConnection.TryGetValue(connection, out int connectionId))
             return;
@@ -148,28 +144,4 @@ public class NetworkServer : MonoBehaviour
         connectionIdByConnection.Remove(connection);
         connectionById.Remove(connectionId);
     }
-
-    public void SendMessageToClient(string msg, int connectionId)
-    {
-        if (connectionById.TryGetValue(connectionId, out NetworkConnection connection))
-            SendMessageToClient(msg, connection);
-    }
-
-    public void SendMessageToClient(string msg, NetworkConnection networkConnection)
-    {
-        byte[] msgAsByteArray = Encoding.Unicode.GetBytes(msg);
-        NativeArray<byte> buffer = new NativeArray<byte>(msgAsByteArray, Allocator.Persistent);
-
-
-        //Driver.BeginSend(m_Connection, out var writer);
-        DataStreamWriter streamWriter;
-        //networkConnection.
-        networkDriver.BeginSend(reliableAndInOrderPipeline, networkConnection, out streamWriter);
-        streamWriter.WriteInt(buffer.Length);
-        streamWriter.WriteBytes(buffer);
-        networkDriver.EndSend(streamWriter);
-
-        buffer.Dispose();
-    }
-
 }

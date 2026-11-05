@@ -33,7 +33,7 @@ The server and the client are two separate Unity projects. Unity can't open the 
    - Both players type the same room name and press **Join / Create Game Room**.
    - To watch a game, a third client logs in, types the room name and presses **Watch Game Room**.
 
-To run the server and clients on **different computers**, change `IPAddress` in `TicTacToeClient/Assets/Scenes/Scripts/NetworkClient.cs` to the server computer's local IP address, then build the client again.
+To run the server and clients on **different computers**, change `ServerIPAddress` in `TicTacToeClient/Assets/Scripts/NetworkClient.cs` to the server computer's local IP address, then build the client again.
 
 ## Features
 
@@ -46,15 +46,18 @@ To run the server and clients on **different computers**, change `IPAddress` in 
 
 ## Code structure
 
+Scripts are in `Assets/Scripts`. The files in `Assets/Scripts/Shared` are identical in both projects, so the client and the server always agree on messages, rules and the board.
+
 | File | Project | Responsibility |
 |---|---|---|
-| `NetworkServer.cs` / `NetworkClient.cs` | both | Unity Transport connections, sending and receiving |
-| `NetworkServerProcessing.cs` | server | Reads incoming messages and passes them to the managers |
-| `NetworkClientProcessing.cs` | client | Reads server messages and builds outgoing messages |
-| `AccountManager.cs` | server | Accounts and which connection belongs to which account |
-| `GameRoomManager.cs` | server | Rooms, players, observers, boards, chat |
-| `TicTacToeBoard.cs` | both | Game rules (no Unity code) |
-| `SharedNetworkDefinitions.cs` | both | Message signifiers, result codes and validation rules |
-| `GameUIManager.cs`, `TicTacToeBoardView.cs`, `UIFactory.cs` | client | UI state machine and screens (built from code, so the scene needs no setup) |
+| `NetworkServer.cs` / `NetworkClient.cs` | each | Unity Transport only: connections, sending and receiving raw messages |
+| `NetworkServerProcessing.cs` / `NetworkClientProcessing.cs` | each | Read incoming messages and send each one to the code that handles it; build outgoing messages |
+| `AccountManager.cs`, `Account.cs`, `PasswordHasher.cs` | server | Accounts, saving/loading, salted password hashes, which connection belongs to which account |
+| `GameRoomManager.cs`, `GameRoom.cs` | server | Rooms, players, observers, moves, rematches and chat |
+| `GameUIManager.cs` | client | UI state machine and the reaction to every server event |
+| `ChatPanel.cs`, `TicTacToeBoardView.cs`, `GameStatusText.cs`, `UIFactory.cs` | client | Reusable UI pieces (built from code, so the scene needs no setup) |
+| `Shared/NetworkSignifiers.cs`, `Shared/NetworkMessage.cs` | shared | Message signifiers and building/reading `signifier,value1,value2,...` messages |
+| `Shared/ResultCode.cs`, `Shared/ValidationRules.cs` | shared | Result codes with their messages; account, room name and chat rules |
+| `Shared/TicTacToeBoard.cs` | shared | Game rules with no Unity code: turns, wins, draws and board serialization |
 
-Messages are comma-separated strings that start with a signifier, for example `7,4` means "place a mark on cell 4". The full list is in `SharedNetworkDefinitions.cs`.
+For example, `7,4` means "place a mark on cell 4". The full list of messages is in `Shared/NetworkSignifiers.cs`.
